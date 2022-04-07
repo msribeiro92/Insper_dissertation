@@ -3,6 +3,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pycountry
+from pytrends.request import TrendReq
+
+from trends import interest_by_country_year
 
 data_path = Path(__file__).parent / 'Data'
 
@@ -31,7 +34,7 @@ def select_cses_columns(cses_df):
         'IMD2005_1': 'religious_attendance',  # RELIGIOUS SERVICES ATTENDANCE
         'IMD2006': 'income',  # HOUSEHOLD
         'IMD2007': 'rural_urban',  # RURAL OR URBAN RESIDENCE
-        'IMD2010': 'race',  # RACE
+        # 'IMD2010': 'race',  # RACE
         'IMD2012_1': 'number_household',   # NUMBER IN HOUSEHOLD IN TOTAL
         'IMD2014': 'employment',  # CURRENT EMPLOYMENT STATUS
 
@@ -96,12 +99,12 @@ def treat_cses_columns(cses_df):
             '8': np.NaN,
             '9': np.NaN
         },
-        'race': {
-            '96': np.NaN,
-            '97': np.NaN,
-            '98': np.NaN,
-            '99': np.NaN,
-        },
+        # 'race': {
+        #     '96': np.NaN,
+        #     '97': np.NaN,
+        #     '98': np.NaN,
+        #     '99': np.NaN,
+        # },
         'number_household': {
             '97': np.NaN,
             '98': np.NaN,
@@ -172,6 +175,7 @@ def treat_cses_columns(cses_df):
     # Simple processing
 
     # Harmonize country codes with other datasets
+    cses_df['Code_2'] = cses_df['Code']
     cses_df['Code'] = cses_df['Code'].apply(lambda x: pycountry.countries.get(alpha_2=x).alpha_3)
 
     # Re-label LR_cses_cat
@@ -285,15 +289,24 @@ def parse_owid():
 
 def encode_categorical_features(df, categorical_columns):
 
-    encoded_measures_df = df.copy()
+    encoded_measures_list = []
 
-    for column in categorical_columns:
-        args1 = {column+'_cses': pd.NamedAgg(column='LR_cses_scale', aggfunc='mean')}
-        cses_encoded_feature = df.groupby(column).agg(**args1).reset_index()
-        encoded_measures_df = encoded_measures_df.merge(cses_encoded_feature, how='left', on=column)
-        args2 = {column+'_rile': pd.NamedAgg(column='LR_rile', aggfunc='mean')}
-        rile_encoded_feature = df.groupby(column).agg(**args2).reset_index()
-        encoded_measures_df = encoded_measures_df.merge(rile_encoded_feature, how='left', on=column)
+    grouped_df = df.groupby(['Code', 'Year'])
+
+    for name, group in grouped_df:
+        for column in categorical_columns:
+            args1 = {column+'_cses': pd.NamedAgg(column='LR_cses_scale', aggfunc='mean')}
+            cses_encoded_feature = group.groupby(column).agg(**args1).reset_index()
+            #cses_encoded_feature = df.groupby(column).agg(**args1).reset_index()
+            group = group.merge(cses_encoded_feature, how='left', on=column)
+            args2 = {column+'_rile': pd.NamedAgg(column='LR_rile', aggfunc='mean')}
+            rile_encoded_feature = group.groupby(column).agg(**args2).reset_index()
+            #rile_encoded_feature = df.groupby(column).agg(**args2).reset_index()
+            group = group.merge(rile_encoded_feature, how='left', on=column)
+
+            encoded_measures_list.append(group)
+
+    encoded_measures_df = pd.concat(encoded_measures_list)
 
     return encoded_measures_df
 
@@ -324,6 +337,30 @@ def aggregate_data(df, categorical_columns, other_columns):
     return aggregated_df
 
 
+def get_social_media_data(df, keywords):
+
+    pytrend = TrendReq()
+    countries = np.unique(df['Code_2'])
+    interest_by_country = []
+
+    for country in countries:
+        interest_by_keywords_list = []
+        for keyword in keywords:
+            temp = interest_by_country_year(pytrend, country, keyword)
+            temp = temp.to_frame()
+            interest_by_keywords_list.append(temp)
+
+        interest_by_keywords = pd.concat(interest_by_keywords_list, axis=1)
+        interest_by_keywords['Year'] = interest_by_keywords.index
+        interest_by_keywords['Code_2'] = country
+
+        interest_by_country.append(interest_by_keywords)
+
+    interest_by_country_df = pd.concat(interest_by_country)
+
+    return interest_by_country_df
+
+
 def generate_dataset():
 
     # Initial dataset
@@ -342,6 +379,9 @@ def generate_dataset():
     merged_df = merged_df.join(wb_df, ['Code', 'Year'])
     merged_df = merged_df.join(owid_df, ['Year'])
 
+    # Remove invalid entries
+    merged_df = merged_df.dropna(subset=['LR_cses_scale', 'LR_rile']).reset_index(drop=True)
+
     merged_df.to_csv("merged_data.csv", index=False)
 
     # Encode categorical features
@@ -352,14 +392,17 @@ def generate_dataset():
         'religious_attendance',
         'income',
         'rural_urban',
-        'race',
+        # 'race',
         'number_household',
         'employment',
     ]
     encoded_df = encode_categorical_features(merged_df, categorical_columns)
 
     # Aggregate by country and year
+    encoded_df = encoded_df.dropna(subset=categorical_columns).reset_index(drop=True)
+
     other_columns = [
+        'Code_2',
         'ic',
         'mc',
         'gdp_growth_t',
@@ -387,6 +430,14 @@ def generate_dataset():
     aggregated_df = aggregated_df.reset_index()
 
     aggregated_df.to_csv("aggregated_data.csv", index=False)
+
+    # Add social media data from Google Trends
+    social_media_keywords = ['facebook', 'twitter', 'youtube']
+    social_media_data = get_social_media_data(aggregated_df, social_media_keywords)
+    social_media_df = aggregated_df.merge(social_media_data, how='left', on=['Year', 'Code_2'])
+    social_media_df = social_media_df.dropna(subset=social_media_keywords)
+
+    social_media_df.to_csv("social_media_data.csv", index=False)
 
 
 generate_dataset()
