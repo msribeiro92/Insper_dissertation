@@ -5,8 +5,6 @@ import pandas as pd
 import pycountry
 from pytrends.request import TrendReq
 
-from trends import interest_by_country_year
-
 data_path = Path(__file__).parent / 'Data'
 
 
@@ -188,7 +186,7 @@ def treat_cses_columns(cses_df):
     cses_df['LR_cses_cat'] = cses_df['LR_cses_cat'].transform(lambda x: pp_cses_dict[str(x)])
 
     # Re-scale for compatibility with LR_rile
-    cses_df['LR_cses_scale'] = cses_df['LR_cses_scale'] * 20 - 100
+    # cses_df['LR_cses_scale'] = cses_df['LR_cses_scale'] * 20 - 100
 
 
 def parse_cses_imd():
@@ -225,10 +223,13 @@ def parse_wb_data():
     df = df.dropna(subset=['Code'])
     df = df.astype({'Year': int})
 
-    columns_to_drop = list(set(df.columns) - set(['Year', 'Code', 'ic', 'mc']))
+    columns_to_drop = list(set(df.columns) - {'Year', 'Code', 'ic', 'mc'})
     df = df.drop(columns=columns_to_drop)
 
     df = df.replace('..', np.NaN)
+
+    add_lagged_columns(df, 'ic', 2)
+    add_lagged_columns(df, 'mc', 2)
 
     return df
 
@@ -313,10 +314,14 @@ def encode_categorical_features(df, categorical_columns):
 
 def calculate_polarization_measures(df):
 
-    # Calculate polarization: variance
+    # Calculate polarization: variance, std
     polarization_measures_df = df.groupby(['Code', 'Year']).agg(
         var_LR_cses_scale=pd.NamedAgg(column='LR_cses_scale', aggfunc='var'),
         var_LR_rile=pd.NamedAgg(column='LR_rile', aggfunc='var'),
+        std_LR_cses_scale=pd.NamedAgg(column='LR_cses_scale', aggfunc='std'),
+        std_LR_rile=pd.NamedAgg(column='LR_rile', aggfunc='std'),
+        mean_LR_cses_scale=pd.NamedAgg(column='LR_cses_scale', aggfunc='mean'),
+        mean_LR_rile=pd.NamedAgg(column='LR_rile', aggfunc='mean'),
     )
 
     return polarization_measures_df
@@ -337,7 +342,49 @@ def aggregate_data(df, categorical_columns, other_columns):
     return aggregated_df
 
 
-def get_social_media_data(df, keywords):
+def add_lagged_columns(df, column_name, nlags):
+
+    column = df[column_name]
+    for i in range(nlags):
+        shifted_column = column.shift(i+1)
+        shifted_column_name = column_name + f"_t_{i+1}"
+        df[shifted_column_name] = shifted_column
+
+
+def interest_by_country_year(pytrend, country, keyword, nlags, cutoffs):
+
+    try:
+        pytrend.build_payload(kw_list=[keyword], timeframe='all', geo=country)
+        interest_over_time_df = pytrend.interest_over_time()
+
+        # Aggregate by year
+        interest_by_year_mean_series = interest_over_time_df[keyword].groupby(interest_over_time_df.index.year).agg('mean')
+        interest_by_year_mean_series.rename(keyword)
+
+        interest_by_year_max_series = interest_over_time_df[keyword].groupby(interest_over_time_df.index.year).agg('max')
+        df_keyword = interest_by_year_mean_series.to_frame()
+        for cutoff in cutoffs:
+            max_value = 0
+            temp_series = interest_by_year_max_series.copy()
+            for i, value in interest_by_year_max_series.iteritems():
+                if value >= cutoff:
+                    max_value = cutoff
+                if max_value == cutoff:
+                    temp_series[i] = 1
+                else:
+                    temp_series[i] = 0
+
+            colum_name = keyword + '_bin_' + str(cutoff)
+            df_keyword[colum_name] = temp_series
+            add_lagged_columns(df_keyword, colum_name, nlags)
+
+    except Exception as e:
+        raise e
+
+    return df_keyword
+
+
+def get_social_media_data(df, keywords, nlags, cutoffs):
 
     pytrend = TrendReq()
     countries = np.unique(df['Code_2'])
@@ -346,9 +393,7 @@ def get_social_media_data(df, keywords):
     for country in countries:
         interest_by_keywords_list = []
         for keyword in keywords:
-            temp = interest_by_country_year(pytrend, country, keyword)
-            temp = temp.to_frame()
-            interest_by_keywords_list.append(temp)
+            interest_by_keywords_list.append(interest_by_country_year(pytrend, country, keyword, nlags, cutoffs))
 
         interest_by_keywords = pd.concat(interest_by_keywords_list, axis=1)
         interest_by_keywords['Year'] = interest_by_keywords.index
@@ -399,12 +444,14 @@ def generate_dataset():
     encoded_df = encode_categorical_features(merged_df, categorical_columns)
 
     # Aggregate by country and year
-    encoded_df = encoded_df.dropna(subset=categorical_columns).reset_index(drop=True)
-
     other_columns = [
         'Code_2',
         'ic',
+        'ic_t_1',
+        'ic_t_2',
         'mc',
+        'mc_t_1',
+        'mc_t_2',
         'gdp_growth_t',
         'gdp_growth_t_1',
         'gdp_growth_t_2',
@@ -420,6 +467,12 @@ def generate_dataset():
         'inf_t',
         'inf_t_1',
         'inf_t_2',
+        'VA',
+        'PV',
+        'GE',
+        'RQ',
+        'RL',
+        'CC'
     ]
     aggregated_df = aggregate_data(encoded_df, categorical_columns, other_columns)
 
@@ -433,9 +486,9 @@ def generate_dataset():
 
     # Add social media data from Google Trends
     social_media_keywords = ['facebook', 'twitter', 'youtube']
-    social_media_data = get_social_media_data(aggregated_df, social_media_keywords)
+    social_media_data = get_social_media_data(aggregated_df, social_media_keywords, 2, [10, 30, 50, 70, 90])
     social_media_df = aggregated_df.merge(social_media_data, how='left', on=['Year', 'Code_2'])
-    social_media_df = social_media_df.dropna(subset=social_media_keywords)
+    social_media_df = social_media_df.dropna(subset=['facebook', 'twitter', 'youtube']).reset_index(drop=True)
 
     social_media_df.to_csv("social_media_data.csv", index=False)
 
