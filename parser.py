@@ -282,8 +282,10 @@ def parse_owid():
     df = pd.read_csv(full_file_name)
 
     parsed_df = pd.DataFrame()
-    parsed_df['Year'] = df[df['Entity'] == 'Social media usage']['Year']
-    parsed_df['sm_US'] = df[df['Entity'] == 'Social media usage']['Technology Diffusion (Comin and Hobijn (2004) and others)']
+    year = df[df['Entity'] == 'Social media usage']['Year']
+    parsed_df['Year'] = year
+    social_media_US = df[df['Entity'] == 'Social media usage']['Technology Diffusion (Comin and Hobijn (2004) and others)']
+    parsed_df['social_media_US'] = social_media_US
 
     return parsed_df
 
@@ -351,18 +353,24 @@ def add_lagged_columns(df, column_name, nlags):
         df[shifted_column_name] = shifted_column
 
 
-def interest_by_country_year(pytrend, country, keyword, nlags, cutoffs):
+def interest_by_country_year(country, keyword, nlags, cutoffs):
+
+    pytrend = TrendReq()
 
     try:
         pytrend.build_payload(kw_list=[keyword], timeframe='all', geo=country)
         interest_over_time_df = pytrend.interest_over_time()
 
-        # Aggregate by year
-        interest_by_year_mean_series = interest_over_time_df[keyword].groupby(interest_over_time_df.index.year).agg('mean')
-        interest_by_year_mean_series.rename(keyword)
+        # Cumulative measure
+        interest_by_year_cum_series = interest_over_time_df[keyword].cumsum()
+        interest_by_year_cum_series = interest_by_year_cum_series.groupby(interest_over_time_df.index.year).agg('mean')
+        interest_by_year_cum_series = interest_by_year_cum_series / interest_by_year_cum_series.iloc[-1]
+        interest_by_year_cum_series.rename(keyword)
 
+        df_keyword = interest_by_year_cum_series.to_frame()
+
+        # Binary measure
         interest_by_year_max_series = interest_over_time_df[keyword].groupby(interest_over_time_df.index.year).agg('max')
-        df_keyword = interest_by_year_mean_series.to_frame()
         for cutoff in cutoffs:
             max_value = 0
             temp_series = interest_by_year_max_series.copy()
@@ -386,14 +394,13 @@ def interest_by_country_year(pytrend, country, keyword, nlags, cutoffs):
 
 def get_social_media_data(df, keywords, nlags, cutoffs):
 
-    pytrend = TrendReq()
     countries = np.unique(df['Code_2'])
     interest_by_country = []
 
     for country in countries:
         interest_by_keywords_list = []
         for keyword in keywords:
-            interest_by_keywords_list.append(interest_by_country_year(pytrend, country, keyword, nlags, cutoffs))
+            interest_by_keywords_list.append(interest_by_country_year(country, keyword, nlags, cutoffs))
 
         interest_by_keywords = pd.concat(interest_by_keywords_list, axis=1)
         interest_by_keywords['Year'] = interest_by_keywords.index
@@ -472,7 +479,7 @@ def generate_dataset():
         'GE',
         'RQ',
         'RL',
-        'CC'
+        'CC',
     ]
     aggregated_df = aggregate_data(encoded_df, categorical_columns, other_columns)
 
@@ -491,6 +498,9 @@ def generate_dataset():
     social_media_df = social_media_df.dropna(subset=['facebook', 'twitter', 'youtube']).reset_index(drop=True)
 
     social_media_df.to_csv("social_media_data.csv", index=False)
+
+    social_media_us_df = owid_df.merge(social_media_data[social_media_data['Code_2'] == 'US'], how='left', on=['Year'])
+    social_media_us_df.to_csv("social_media_data_us.csv", index=False)
 
 
 generate_dataset()
